@@ -25,3 +25,31 @@ Compares scalar results across the five friction coefficients. It plots the pair
 **analyze_radial_porosity.py**
 
 Compares spatial porosity profiles across the five friction coefficients. It generates friction-resolved wall-to-wall, vertical, diagonal, and lateral-zone porosity plots.
+
+## Run on local machine 
+There are 2 options 
+
+1. Directly run it with the following commands, where SLURM_CPUS_PER_TASK specify the number of cores you want.
+
+
+
+**SLURM_CPUS_PER_TASK=2 python3 run_parameter_study.py dispatch**
+
+**SLURM_CPUS_PER_TASK=2 python3 run_parameter_study.py postprocess**
+
+
+
+2. Change the value of MAX_SIMULTANEOUS_JOBS, and run the following commands in order:
+
+
+
+**run_parameter_study.py dispatch**
+
+**run_parameter_study.py postprocess**
+
+
+
+## Run on slurm 
+Submit the following and it runs post-processing as well.
+
+**sbatch run_friction_sensitivity_cm4_tiny.sh**
