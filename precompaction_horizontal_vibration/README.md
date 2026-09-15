@@ -9,11 +9,17 @@ The source beds contain 80 rocks. The saved rock positions and orientations are 
 The active method is defined in rock_packing_vibrating_box_random_spawn.py:
 
 enableVibration = 1
+
 vibrationAxis = "x"
+
 vibAmplitudeFrac = 0.008
+
 vibPeriodSteps = 3000
+
 vibrationSteps = 30000
+
 vibrationRampSteps = 3000
+
 enableCompression = 0
 
 The vibration amplitude is 0.008 times the initial box width in the X direction. The amplitude ramps up and down over 3000 iterations. After 30000 vibration iterations, the box returns to its original position and the rocks settle again.
@@ -72,6 +78,11 @@ porosity_result.csv
 rock_1.stl to rock_4.stl
 
 The preflight check verifies that every source case has nRocksTarget = 80.
+
+# Run locally 
+**python3 run_parameter_study.py dispatch**
+
+**python3 run_parameter_study.py postprocess**
 
 # Run on CoolMUC-4
 
