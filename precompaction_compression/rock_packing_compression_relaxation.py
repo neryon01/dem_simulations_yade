@@ -1,0 +1,1999 @@
+import gts
+from yade import export
+from yade import pack
+from yade import utils
+from yade import Vector3
+
+import math
+import os
+import random
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+O.reset()
+
+# Enable YADE's built-in cumulative per-engine timing.
+# Each engine stores total execution time across the whole simulation in
+# engine.execTime and the number of calls in engine.execCount.
+O.timingEnabled = True
+
+
+# ============================================================
+# ALL USER / PARAMETER-STUDY SETTINGS
+# ============================================================
+# Defaults rebuild an already compressed-and-settled 80-rock bed from the
+# existing ``runs/run_NNN`` outputs. The four lateral walls start at the
+# compressed bounds recorded in the source yade_metrics.csv, move back to the
+# recorded original bounds, and are then held fixed while the bed settles.
+#
+utils.readParamsFromTable(
+    description="compression_relaxation",
+    runId=0,
+    sourceRunId=0,
+
+    # Independent random streams. Changing spawnSeed changes only insertion
+    # positions; changing rockTypeSeed changes only the rock-type sequence.
+    spawnSeed=24680,
+    rockTypeSeed=13579,
+
+    # Rocks and spawning
+    nRocks=80,
+    # Deterministic repeating order: rock_1, rock_2, rock_3, rock_4, ...
+    # Study values are multiples of four, so every rock type occurs equally.
+    rockSelectionMode="sequence",
+    spawnMode="random",            # "random" or "center"
+    spawnWallMarginFracL=0.6,      # horizontal wall margin / L
+    spawnZFracL=5.0,               # absolute spawn-center z / L
+    insertionPeriodSeconds=0.70,   # physical simulation time between insertions [s]
+
+    # Box geometry. geom.facetBox uses HALF-extents. x and y deliberately
+    # share one setting; z can be adjusted independently.
+    boxHalfExtentXYFracL=2.0,      # box half-width / L in x and y
+    boxHalfExtentZFracL=2.8,       # box half-height / L in z
+    boxCenterZFracL=2.0,           # box-center z / L
+
+    # Hertz-Mindlin materials
+    # Suhr and Six material table. Friction inputs are coefficients mu;
+    # FrictMat receives atan(mu) below because it expects an angle [rad].
+    rockYoung=20.0e9,
+    rockPoisson=0.20,
+    rockFrictionCoefficient=0.45,
+    rockDensity=2660.0,
+    boxYoung=200.0e9,
+    boxPoisson=0.28,
+    boxFrictionCoefficient=0.50,
+    boxDensity=7833.34,
+
+    # Legacy settings retained for source-metadata compatibility. Neither
+    # vibration nor a second compression is performed in this workflow.
+    enableVibration=0,
+    vibrationAxis="x",            # "x" or "z"
+    vibAmplitudeFrac=0.008,        # vibx=0.008; use 0.004 in the vibz folder
+    vibPeriodSteps=3000,           # iterations per full cycle
+    vibrationSteps=30000,          # total vibration duration [iterations]
+    vibrationRampSteps=3000,       # smooth ramp at each end [iterations]
+
+    # Source-compression metadata. Compression is not repeated here.
+    enableCompression=0,
+    compressionWidthReductionFrac=0.15,
+    # Above is TOTAL horizontal width reduction. Each opposing side wall
+    # moves by half of this fraction times the initial box width.
+    compressionSteps=20000,
+    lidHeightMode="above_pile",    # "above_pile" or "fixed_fraction"
+    lidHeightFraction=0.8,         # used only for "fixed_fraction"
+    lidClearanceFracL=0.05,        # used only for "above_pile"
+    compressFloor=0,               # 0/1
+    compressTop=0,                 # 0/1; lid exists either way
+
+    # Reverse the lateral-wall motion with the same smoothstep duration used
+    # for the completed compression study.
+    relaxationSteps=20000,
+
+    # Settling, time step, and output
+    # A phase changes only after unbalanced force remains below its threshold
+    # for settleHoldSteps consecutive iterations. Every rock must also have a
+    # current external contact, so free flight cannot look falsely settled.
+    settleUbThreshold=1.0e-3,      # before vibration/compression
+    finalUbThreshold=1.0e-3,       # after the final operation
+    settleHoldSteps=2000,
+    minimumSettlingSteps=5000,
+    # Fallback deadline counted only AFTER the final rock is inserted. Normal
+    # equilibrium can finish the run earlier. If this limit is reached, the
+    # run still exports geometry and performs all requested post-processing.
+    maximumIterationsAfterLastInsertion=5000000,
+    # Escape guard. A complete clump is erased when the lowest surface of any
+    # member sphere lies farther than this margin below the CURRENT box floor.
+    # The margin is scaled by the characteristic rock size L.
+    escapeBelowFloorMarginFracL=0.50,
+    escapeCheckPeriod=100,
+    newtonDamping=0.4,
+    timestepSafety=0.25,
+    vtkExportPeriod=0,              # <= 0 disables periodic VTK; final frame remains
+    poseExportPeriod=1000000,
+    residualExportPeriod=1000,
+    # Evaluated once, after settling, using YADE's sphere-sphere utility.
+    maximumAllowedOverlapFraction=0.01,  # 1% of the relevant sphere radius
+    enablePostProcessing=1,        # reconstruct STL + calculate porosity/contacts
+    # Axial inset for the side-wall-inclusive global porosity and six-side
+    # inset for the separately reported interior porosity. The untrimmed bed
+    # remains available as a diagnostic and for the wall-distance profile.
+    porosityBoundaryMarginFracL=0.25,
+
+    noTableOk=True,
+)
+from yade.params import table
+
+
+# ============================================================
+# PARSE AND VALIDATE SETTINGS
+# ============================================================
+
+RUN_ID = int(table.runId)
+SOURCE_RUN_ID = int(table.sourceRunId)
+SPAWN_SEED = int(table.spawnSeed)
+ROCK_TYPE_SEED = int(table.rockTypeSeed)
+
+# Separate random generators prevent a change in the rock-type draw from
+# changing the insertion positions, and vice versa.
+spawnRng = random.Random(SPAWN_SEED)
+rockTypeRng = random.Random(ROCK_TYPE_SEED)
+
+nRocks = int(table.nRocks)
+ROCK_SELECTION_MODE = str(table.rockSelectionMode).strip().lower()
+SPAWN_MODE = str(table.spawnMode).strip().lower()
+SPAWN_WALL_MARGIN_FRAC_L = float(table.spawnWallMarginFracL)
+SPAWN_Z_FRAC_L = float(table.spawnZFracL)
+INSERTION_PERIOD_SECONDS = float(table.insertionPeriodSeconds)
+
+BOX_HALF_EXTENT_XY_FRAC_L = float(table.boxHalfExtentXYFracL)
+BOX_HALF_EXTENT_Z_FRAC_L = float(table.boxHalfExtentZFracL)
+BOX_CENTER_Z_FRAC_L = float(table.boxCenterZFracL)
+
+ROCK_DENSITY = float(table.rockDensity)
+ROCK_FRICTION_COEFFICIENT = float(table.rockFrictionCoefficient)
+BOX_FRICTION_COEFFICIENT = float(table.boxFrictionCoefficient)
+
+ENABLE_VIBRATION = bool(int(table.enableVibration))
+VIBRATION_AXIS = str(table.vibrationAxis).strip().lower()
+VIB_AMPLITUDE_FRAC = float(table.vibAmplitudeFrac)
+VIB_PERIOD_STEPS = int(table.vibPeriodSteps)
+VIBRATION_STEPS = int(table.vibrationSteps)
+VIBRATION_RAMP_STEPS = int(table.vibrationRampSteps)
+
+ENABLE_COMPRESSION = bool(int(table.enableCompression))
+COMPRESSION_WIDTH_REDUCTION_FRAC = float(table.compressionWidthReductionFrac)
+COMPRESSION_STEPS = int(table.compressionSteps)
+LID_HEIGHT_MODE = str(table.lidHeightMode).strip().lower()
+LID_HEIGHT_FRACTION = float(table.lidHeightFraction)
+LID_CLEARANCE_FRAC_L = float(table.lidClearanceFracL)
+COMPRESS_FLOOR = bool(int(table.compressFloor))
+COMPRESS_TOP = bool(int(table.compressTop))
+RELAXATION_STEPS = int(table.relaxationSteps)
+
+SETTLE_UB_THRESHOLD = float(table.settleUbThreshold)
+FINAL_UB_THRESHOLD = float(table.finalUbThreshold)
+SETTLE_HOLD_STEPS = int(table.settleHoldSteps)
+MINIMUM_SETTLING_STEPS = int(table.minimumSettlingSteps)
+MAXIMUM_ITERATIONS_AFTER_LAST_INSERTION = int(
+    table.maximumIterationsAfterLastInsertion
+)
+ESCAPE_BELOW_FLOOR_MARGIN_FRAC_L = float(table.escapeBelowFloorMarginFracL)
+ESCAPE_CHECK_PERIOD = int(table.escapeCheckPeriod)
+NEWTON_DAMPING = float(table.newtonDamping)
+TIMESTEP_SAFETY = float(table.timestepSafety)
+# Optional one-launch override. If the environment variable is absent, the
+# table value remains authoritative (default 0, so Slurm produces no periodic
+# VTK files).
+VTK_EXPORT_PERIOD = int(
+    os.environ.get("YADE_VTK_EXPORT_PERIOD", table.vtkExportPeriod)
+)
+POSE_EXPORT_PERIOD = int(table.poseExportPeriod)
+RESIDUAL_EXPORT_PERIOD = int(table.residualExportPeriod)
+MAXIMUM_ALLOWED_OVERLAP_FRACTION = float(table.maximumAllowedOverlapFraction)
+ENABLE_POST_PROCESSING = bool(int(table.enablePostProcessing))
+POROSITY_BOUNDARY_MARGIN_FRAC_L = float(table.porosityBoundaryMarginFracL)
+
+# The parameter-study runner sets this only while YADE is executing inside the
+# Apptainer image.  The image intentionally supplies YADE, whereas the host
+# yadepy environment supplies VTK and the remaining analysis packages.  A
+# direct/standalone YADE run still performs post-processing here unless this
+# launch-only environment flag is set.
+DEFER_POST_PROCESSING_TO_RUNNER = (
+    os.environ.get("YADE_DEFER_POST_PROCESSING", "0") == "1"
+)
+
+if nRocks < 1:
+    raise ValueError("nRocks must be at least 1.")
+if MAXIMUM_ALLOWED_OVERLAP_FRACTION <= 0.0:
+    raise ValueError("maximumAllowedOverlapFraction must be positive.")
+if ROCK_SELECTION_MODE not in {"random", "rock_1", "sequence"}:
+    raise ValueError(
+        "rockSelectionMode must be 'random', 'rock_1', or 'sequence'."
+    )
+if SPAWN_MODE not in {"random", "center"}:
+    raise ValueError("spawnMode must be 'random' or 'center'.")
+if VIBRATION_AXIS not in {"x", "y", "z"}:
+    raise ValueError("vibrationAxis must be 'x', 'y', or 'z'.")
+if ENABLE_VIBRATION and (VIB_PERIOD_STEPS <= 0 or VIBRATION_STEPS <= 0):
+    raise ValueError("Vibration period and duration must be positive when vibration is enabled.")
+if VIB_AMPLITUDE_FRAC < 0:
+    raise ValueError("vibAmplitudeFrac must be non-negative.")
+if ENABLE_VIBRATION or ENABLE_COMPRESSION:
+    raise ValueError(
+        "This script is relaxation-only: enableVibration and "
+        "enableCompression must both be 0."
+    )
+if RELAXATION_STEPS <= 0:
+    raise ValueError("relaxationSteps must be positive.")
+if not 0.0 <= COMPRESSION_WIDTH_REDUCTION_FRAC < 1.0:
+    raise ValueError("compressionWidthReductionFrac must be in [0, 1).")
+if LID_HEIGHT_MODE not in {"above_pile", "fixed_fraction"}:
+    raise ValueError("lidHeightMode must be 'above_pile' or 'fixed_fraction'.")
+if not 0.0 <= LID_HEIGHT_FRACTION <= 1.0:
+    raise ValueError("lidHeightFraction must be in [0, 1].")
+if INSERTION_PERIOD_SECONDS <= 0:
+    raise ValueError("insertionPeriodSeconds must be positive.")
+if min(POSE_EXPORT_PERIOD, RESIDUAL_EXPORT_PERIOD) <= 0:
+    raise ValueError("Pose-export and residual-export periods must be positive.")
+if min(BOX_HALF_EXTENT_XY_FRAC_L, BOX_HALF_EXTENT_Z_FRAC_L) <= 0:
+    raise ValueError("Box x/y and z half-extents must be positive.")
+if TIMESTEP_SAFETY <= 0:
+    raise ValueError("timestepSafety must be positive.")
+if ROCK_DENSITY <= 0 or float(table.boxDensity) <= 0:
+    raise ValueError("Rock and box densities must be positive.")
+if ROCK_FRICTION_COEFFICIENT < 0 or BOX_FRICTION_COEFFICIENT < 0:
+    raise ValueError("Friction coefficients mu cannot be negative.")
+if SETTLE_UB_THRESHOLD < 0 or FINAL_UB_THRESHOLD < 0:
+    raise ValueError("Unbalanced-force settling thresholds cannot be negative.")
+if SETTLE_HOLD_STEPS <= 0 or MINIMUM_SETTLING_STEPS < 0:
+    raise ValueError("settleHoldSteps must be positive and minimumSettlingSteps non-negative.")
+if MAXIMUM_ITERATIONS_AFTER_LAST_INSERTION <= 0:
+    raise ValueError(
+        "maximumIterationsAfterLastInsertion must be positive."
+    )
+if ESCAPE_BELOW_FLOOR_MARGIN_FRAC_L < 0:
+    raise ValueError("escapeBelowFloorMarginFracL cannot be negative.")
+if ESCAPE_CHECK_PERIOD <= 0:
+    raise ValueError("escapeCheckPeriod must be positive.")
+if POROSITY_BOUNDARY_MARGIN_FRAC_L < 0:
+    raise ValueError("porosityBoundaryMarginFracL cannot be negative.")
+
+# The launcher uses this mode to test the exact embedded YADE Python runtime
+# and the active method settings.  It exits before creating any run outputs.
+if os.environ.get("YADE_IMPORT_PREFLIGHT_ONLY", "0") == "1":
+    print(
+        "YADE runtime/configuration preflight passed: pandas {} / NumPy {}; "
+        "enableVibration={}, enableCompression={}, relaxationSteps={}, "
+        "nRocks={}".format(
+            pd.__version__,
+            np.__version__,
+            ENABLE_VIBRATION,
+            ENABLE_COMPRESSION,
+            RELAXATION_STEPS,
+            nRocks,
+        )
+    )
+    raise SystemExit(0)
+
+
+# ============================================================
+# RUN DIRECTORY AND POST-PROCESSING FILES
+# ============================================================
+
+# yade-batch launches /usr/bin/yade-double with ``-x script.py``. In that
+# process, __file__ can incorrectly resolve below /usr/bin even though the
+# batch working directory is the study folder. The launcher always sets cwd to
+# the study folder, so cwd is the authoritative project root here.
+ROOT = Path.cwd().resolve()
+RUN_DIR = ROOT / "relaxation_runs" / f"run_{RUN_ID:03d}"
+SOURCE_COMPRESSED_RUNS_DIR = Path(
+    os.environ.get("COMPRESSED_SOURCE_RUNS_DIR", ROOT / "runs")
+).resolve()
+SOURCE_RUN_DIR = SOURCE_COMPRESSED_RUNS_DIR / f"run_{SOURCE_RUN_ID:03d}"
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+RECONSTRUCT_SCRIPT = ROOT / "reconstruct_stl_w_distance.py"
+POROSITY_SCRIPT = ROOT / "rock_porosity.py"
+
+for stl_name in ["rock_1.stl", "rock_2.stl", "rock_3.stl", "rock_4.stl"]:
+    shutil.copy2(SOURCE_RUN_DIR / stl_name, RUN_DIR / stl_name)
+
+wall_time_start = time.time()
+
+print("RUN_ID =", RUN_ID)
+print("SOURCE_RUN_ID =", SOURCE_RUN_ID)
+print("SOURCE_RUN_DIR =", SOURCE_RUN_DIR)
+print("SPAWN_SEED =", SPAWN_SEED)
+print("ROCK_TYPE_SEED =", ROCK_TYPE_SEED)
+print("rockSelectionMode =", ROCK_SELECTION_MODE)
+print("Initialization = reconstructed final compressed poses")
+print("CONTACT_MODEL = Hertz-Mindlin")
+print("RELAXATION_STEPS =", RELAXATION_STEPS)
+print("VTK export period =", VTK_EXPORT_PERIOD)
+print(
+    "Escape guard: erase a complete clump when its lowest member surface is",
+    "below the current floor by more than",
+    ESCAPE_BELOW_FLOOR_MARGIN_FRAC_L,
+    "L",
+)
+
+
+# ============================================================
+# LOAD ROCK TEMPLATES AND COMPUTE CHARACTERISTIC SIZE L
+# ============================================================
+
+ROCK_GTS_FILES = [
+    "rock_1.gts",
+    "rock_2.gts",
+    "rock_3.gts",
+    "rock_4.gts",
+]
+
+# Final particle-specific geometry selections. Lattice rotation changes the
+# member-sphere arrangement relative to the rock; it is not the initial
+# orientation of the complete falling rock.
+SELECTED_CLUMP_CONFIGURATIONS = {
+    1: {"divisor": 12, "overlapFraction": 0.30, "rotation": "identity", "expectedSpheres": 103},
+    2: {"divisor": 9,  "overlapFraction": 0.30, "rotation": "identity", "expectedSpheres": 122},
+    3: {"divisor": 11, "overlapFraction": 0.50, "rotation": "identity", "expectedSpheres": 126},
+    4: {"divisor": 11, "overlapFraction": 0.30, "rotation": "z_30deg", "expectedSpheres": 118},
+}
+
+LATTICE_ROTATIONS = {
+    "identity": ((1.0, 0.0, 0.0), 0.0),
+    "x_30deg": ((1.0, 0.0, 0.0), 30.0),
+    "y_30deg": ((0.0, 1.0, 0.0), 30.0),
+    "z_30deg": ((0.0, 0.0, 1.0), 30.0),
+}
+
+
+def rotation_matrix(axis, angle_degrees):
+    """Return the right-handed Rodrigues rotation matrix."""
+    axis = np.asarray(axis, dtype=float)
+    axis /= np.linalg.norm(axis)
+    x_axis, y_axis, z_axis = axis
+    angle = math.radians(angle_degrees)
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    one_minus_cosine = 1.0 - cosine
+    return np.asarray([
+        [
+            cosine + x_axis * x_axis * one_minus_cosine,
+            x_axis * y_axis * one_minus_cosine - z_axis * sine,
+            x_axis * z_axis * one_minus_cosine + y_axis * sine,
+        ],
+        [
+            y_axis * x_axis * one_minus_cosine + z_axis * sine,
+            cosine + y_axis * y_axis * one_minus_cosine,
+            y_axis * z_axis * one_minus_cosine - x_axis * sine,
+        ],
+        [
+            z_axis * x_axis * one_minus_cosine - y_axis * sine,
+            z_axis * y_axis * one_minus_cosine + x_axis * sine,
+            cosine + z_axis * z_axis * one_minus_cosine,
+        ],
+    ])
+
+
+def generate_selected_hexagonal_pack(gts_filename, configuration):
+    """Regenerate one selected centre-clipped HEXA candidate exactly."""
+    with open(gts_filename, "r") as handle:
+        surface = gts.read(handle)
+
+    unrotated_predicate = pack.inGtsSurface(surface, True)
+    unrotated_aabb = unrotated_predicate.aabb()
+    minimum = np.asarray(unrotated_aabb[0], dtype=float)
+    maximum = np.asarray(unrotated_aabb[1], dtype=float)
+    center = 0.5 * (minimum + maximum)
+    dx, dy, dz = maximum - minimum
+
+    rotation_label = configuration["rotation"]
+    rotation_axis, angle_degrees = LATTICE_ROTATIONS[rotation_label]
+
+    if angle_degrees:
+        surface.translate(-center[0], -center[1], -center[2])
+        surface.rotate(
+            rotation_axis[0],
+            rotation_axis[1],
+            rotation_axis[2],
+            math.radians(angle_degrees),
+        )
+        surface.translate(center[0], center[1], center[2])
+
+    predicate = pack.inGtsSurface(surface, True)  # centre-based clipping
+    member_radius = dx / float(configuration["divisor"])
+    member_gap = -configuration["overlapFraction"] * member_radius
+    member_bodies = pack.regularHexa(
+        predicate,
+        radius=member_radius,
+        gap=member_gap,
+    )
+
+    if angle_degrees and member_bodies:
+        inverse_rotation = rotation_matrix(rotation_axis, angle_degrees).T
+        for member in member_bodies:
+            position = np.asarray([
+                float(member.state.pos[0]),
+                float(member.state.pos[1]),
+                float(member.state.pos[2]),
+            ])
+            mapped = center + inverse_rotation.dot(position - center)
+            member.state.pos = Vector3(*mapped)
+
+    return member_bodies, float(dx), float(dy), float(dz), member_radius, member_gap
+
+
+L = 0.0
+spherePacks = []
+template_rows = []
+
+for rock_index, gts_filename in enumerate(ROCK_GTS_FILES, start=1):
+    configuration = SELECTED_CLUMP_CONFIGURATIONS[rock_index]
+    sphere_pack, dx, dy, dz, member_radius, member_gap = (
+        generate_selected_hexagonal_pack(gts_filename, configuration)
+    )
+    L = max(L, dx, dy, dz)
+
+    actual_count = len(sphere_pack)
+    expected_count = configuration["expectedSpheres"]
+    if actual_count != expected_count:
+        raise RuntimeError(
+            "Selected clump regeneration mismatch for rock {}: expected {} "
+            "member spheres, generated {}. Check that the GTS files are the "
+            "same files used in the geometry-screening study.".format(
+                rock_index, expected_count, actual_count
+            )
+        )
+
+    spherePacks.append(sphere_pack)
+    template_rows.append({
+        "rockType": rock_index,
+        "gtsFile": gts_filename,
+        "resolutionDivisor": configuration["divisor"],
+        "overlapDepthFractionOfRadius": configuration["overlapFraction"],
+        "latticeRotation": configuration["rotation"],
+        "memberRadius": member_radius,
+        "memberGap": member_gap,
+        "memberSphereCount": actual_count,
+        "dx": dx,
+        "dy": dy,
+        "dz": dz,
+    })
+    print(
+        "Rock {} template: d={}, overlap={:.2f}r, rotation={}, spheres={}".format(
+            rock_index,
+            configuration["divisor"],
+            configuration["overlapFraction"],
+            configuration["rotation"],
+            actual_count,
+        )
+    )
+
+if L <= 0:
+    raise RuntimeError("Could not determine a positive characteristic rock size L.")
+
+print("Characteristic rock size L =", L)
+pd.DataFrame(template_rows).to_csv(
+    RUN_DIR / "clump_template_configurations.csv", index=False
+)
+print("Saved: clump_template_configurations.csv")
+
+
+# ============================================================
+# MATERIALS AND CONTACT LAW
+# ============================================================
+
+rockMat = FrictMat(
+    young=float(table.rockYoung),
+    poisson=float(table.rockPoisson),
+    frictionAngle=math.atan(ROCK_FRICTION_COEFFICIENT),
+    density=ROCK_DENSITY,
+)
+boxMat = FrictMat(
+    young=float(table.boxYoung),
+    poisson=float(table.boxPoisson),
+    frictionAngle=math.atan(BOX_FRICTION_COEFFICIENT),
+    density=float(table.boxDensity),
+)
+matId_rock = O.materials.append(rockMat)
+matId_box = O.materials.append(boxMat)
+
+# The study uses Hertz-Mindlin exclusively, with no alternative-law branch or
+# contact-law selector in the parameter table.
+contact_ip2 = [Ip2_FrictMat_FrictMat_MindlinPhys()]
+contact_law2 = [Law2_ScGeom_MindlinPhys_Mindlin()]
+
+print(
+    "Rock friction: mu =", ROCK_FRICTION_COEFFICIENT,
+    "-> frictionAngle =", rockMat.frictionAngle, "rad"
+)
+print(
+    "Box friction: mu =", BOX_FRICTION_COEFFICIENT,
+    "-> frictionAngle =", boxMat.frictionAngle, "rad"
+)
+
+
+# ============================================================
+# COMPRESSED STARTING BOX AND ORIGINAL TARGET BOUNDS
+# ============================================================
+
+# The source compression run records both sets of bounds:
+#   unprefixed box* fields       = compressed final bounds;
+#   initialBox* fields           = original pre-compression bounds.
+# Rebuild the source boundary state at the compressed bounds, including the
+# stationary compression lid. The lid is removed only after the four lateral
+# walls reach their original positions, so the restart begins from the same
+# confinement state and ends with the original open-top box.
+def read_source_compression_metrics():
+    path = SOURCE_RUN_DIR / "yade_metrics.csv"
+    frame = pd.read_csv(path)
+    if len(frame) != 1:
+        raise RuntimeError("Source yade_metrics.csv must contain exactly one row.")
+    row = frame.iloc[0]
+    required = {
+        "simulationMode", "nRocksRetainedInYade", "compressionSteps",
+        "compressionWidthReductionFrac", "compressionTotalDisplacementPerWall",
+        "compressFloor", "compressTop",
+        "initialBoxXMin", "initialBoxXMax", "initialBoxYMin", "initialBoxYMax",
+        "initialBoxFloorZ", "initialBoxTopZ", "boxXMin", "boxXMax",
+        "boxYMin", "boxYMax", "boxFloorZ", "boxTopZ",
+    }
+    missing = sorted(required - set(row.index))
+    if missing:
+        raise RuntimeError(
+            "Source yade_metrics.csv is missing: " + ", ".join(missing)
+        )
+    if "compression" not in str(row["simulationMode"]).lower():
+        raise RuntimeError(
+            "Source run is not a completed compression run: simulationMode={}"
+            .format(row["simulationMode"])
+        )
+    if int(row["compressFloor"]) != 0 or int(row["compressTop"]) != 0:
+        raise RuntimeError(
+            "This workflow expects the completed lateral-only compression "
+            "study (compressFloor=0 and compressTop=0)."
+        )
+    if int(row["compressionSteps"]) != RELAXATION_STEPS:
+        raise RuntimeError(
+            "relaxationSteps={} must equal the source compressionSteps={} so "
+            "the wall motion is reversed with the same duration."
+            .format(RELAXATION_STEPS, int(row["compressionSteps"]))
+        )
+    return row
+
+
+sourceCompressionMetrics = read_source_compression_metrics()
+
+SOURCE_BOX_X_MIN = float(sourceCompressionMetrics["boxXMin"])
+SOURCE_BOX_X_MAX = float(sourceCompressionMetrics["boxXMax"])
+SOURCE_BOX_Y_MIN = float(sourceCompressionMetrics["boxYMin"])
+SOURCE_BOX_Y_MAX = float(sourceCompressionMetrics["boxYMax"])
+SOURCE_BOX_FLOOR_Z = float(sourceCompressionMetrics["boxFloorZ"])
+SOURCE_COMPRESSION_LID_Z = float(sourceCompressionMetrics["boxTopZ"])
+
+TARGET_BOX_X_MIN = float(sourceCompressionMetrics["initialBoxXMin"])
+TARGET_BOX_X_MAX = float(sourceCompressionMetrics["initialBoxXMax"])
+TARGET_BOX_Y_MIN = float(sourceCompressionMetrics["initialBoxYMin"])
+TARGET_BOX_Y_MAX = float(sourceCompressionMetrics["initialBoxYMax"])
+TARGET_BOX_FLOOR_Z = float(sourceCompressionMetrics["initialBoxFloorZ"])
+TARGET_BOX_TOP_Z = float(sourceCompressionMetrics["initialBoxTopZ"])
+
+if not (SOURCE_BOX_X_MIN < SOURCE_BOX_X_MAX and SOURCE_BOX_Y_MIN < SOURCE_BOX_Y_MAX):
+    raise RuntimeError("Source compressed lateral bounds are invalid.")
+if not (TARGET_BOX_X_MIN < TARGET_BOX_X_MAX and TARGET_BOX_Y_MIN < TARGET_BOX_Y_MAX):
+    raise RuntimeError("Source original lateral bounds are invalid.")
+if SOURCE_BOX_X_MIN <= TARGET_BOX_X_MIN or SOURCE_BOX_X_MAX >= TARGET_BOX_X_MAX:
+    raise RuntimeError("Source x walls are not inward of their original positions.")
+if SOURCE_BOX_Y_MIN <= TARGET_BOX_Y_MIN or SOURCE_BOX_Y_MAX >= TARGET_BOX_Y_MAX:
+    raise RuntimeError("Source y walls are not inward of their original positions.")
+if not np.isclose(SOURCE_BOX_FLOOR_Z, TARGET_BOX_FLOOR_Z, rtol=1.0e-10, atol=1.0e-12):
+    raise RuntimeError("The source floor moved, but this workflow relaxes lateral walls only.")
+if SOURCE_COMPRESSION_LID_Z <= SOURCE_BOX_FLOOR_Z:
+    raise RuntimeError("Source compression-lid height is not above the box floor.")
+
+BOX_HALF_EXTENT_XY = BOX_HALF_EXTENT_XY_FRAC_L * L
+BOX_HALF_EXTENT_Z = BOX_HALF_EXTENT_Z_FRAC_L * L
+BOX_CENTER = Vector3(
+    0.5 * (SOURCE_BOX_X_MIN + SOURCE_BOX_X_MAX),
+    0.5 * (SOURCE_BOX_Y_MIN + SOURCE_BOX_Y_MAX),
+    0.5 * (TARGET_BOX_FLOOR_Z + TARGET_BOX_TOP_Z),
+)
+START_BOX_HALF_EXTENT_X = 0.5 * (SOURCE_BOX_X_MAX - SOURCE_BOX_X_MIN)
+START_BOX_HALF_EXTENT_Y = 0.5 * (SOURCE_BOX_Y_MAX - SOURCE_BOX_Y_MIN)
+START_BOX_HALF_EXTENT_Z = 0.5 * (TARGET_BOX_TOP_Z - TARGET_BOX_FLOOR_Z)
+
+c_box = geom.facetBox(
+    BOX_CENTER,
+    (START_BOX_HALF_EXTENT_X, START_BOX_HALF_EXTENT_Y, START_BOX_HALF_EXTENT_Z),
+    wallMask=31,  # floor + four sides; original and relaxed states are open-top
+    material=matId_box,
+)
+O.bodies.append(c_box)
+
+boxIds = [body.id for body in c_box]
+sourceCompressionLidIds = O.bodies.append([
+    utils.facet([
+        Vector3(TARGET_BOX_X_MIN, TARGET_BOX_Y_MIN, SOURCE_COMPRESSION_LID_Z),
+        Vector3(TARGET_BOX_X_MAX, TARGET_BOX_Y_MIN, SOURCE_COMPRESSION_LID_Z),
+        Vector3(TARGET_BOX_X_MAX, TARGET_BOX_Y_MAX, SOURCE_COMPRESSION_LID_Z),
+    ], material=matId_box),
+    utils.facet([
+        Vector3(TARGET_BOX_X_MIN, TARGET_BOX_Y_MIN, SOURCE_COMPRESSION_LID_Z),
+        Vector3(TARGET_BOX_X_MAX, TARGET_BOX_Y_MAX, SOURCE_COMPRESSION_LID_Z),
+        Vector3(TARGET_BOX_X_MIN, TARGET_BOX_Y_MAX, SOURCE_COMPRESSION_LID_Z),
+    ], material=matId_box),
+])
+boxIds.extend(sourceCompressionLidIds)
+boxInitialPos = {bid: Vector3(O.bodies[bid].state.pos) for bid in boxIds}
+
+initialBoxXMin = SOURCE_BOX_X_MIN
+initialBoxXMax = SOURCE_BOX_X_MAX
+initialBoxYMin = SOURCE_BOX_Y_MIN
+initialBoxYMax = SOURCE_BOX_Y_MAX
+initialBoxFloorZ = TARGET_BOX_FLOOR_Z
+initialBoxTopZ = TARGET_BOX_TOP_Z
+
+INITIAL_BOX_WIDTH_X = TARGET_BOX_X_MAX - TARGET_BOX_X_MIN
+INITIAL_BOX_WIDTH_Y = TARGET_BOX_Y_MAX - TARGET_BOX_Y_MIN
+INITIAL_BOX_HEIGHT = initialBoxTopZ - initialBoxFloorZ
+
+SPAWN_WALL_MARGIN = SPAWN_WALL_MARGIN_FRAC_L * L
+spawnXMin = initialBoxXMin + SPAWN_WALL_MARGIN
+spawnXMax = initialBoxXMax - SPAWN_WALL_MARGIN
+spawnYMin = initialBoxYMin + SPAWN_WALL_MARGIN
+spawnYMax = initialBoxYMax - SPAWN_WALL_MARGIN
+spawnZ = SPAWN_Z_FRAC_L * L
+
+if spawnXMin >= spawnXMax or spawnYMin >= spawnYMax:
+    raise ValueError("spawnWallMarginFracL leaves no valid horizontal spawn region.")
+if spawnZ <= initialBoxTopZ:
+    print("WARNING: spawn z is not above the open top of the box.")
+
+print(
+    f"Compressed starting box: x=[{initialBoxXMin:.4g},{initialBoxXMax:.4g}] "
+    f"y=[{initialBoxYMin:.4g},{initialBoxYMax:.4g}] "
+    f"z=[{initialBoxFloorZ:.4g},{initialBoxTopZ:.4g}]"
+)
+print(
+    f"Original target box: x=[{TARGET_BOX_X_MIN:.4g},{TARGET_BOX_X_MAX:.4g}] "
+    f"y=[{TARGET_BOX_Y_MIN:.4g},{TARGET_BOX_Y_MAX:.4g}]"
+)
+print(f"Recreated stationary source compression lid at z={SOURCE_COMPRESSION_LID_Z:.4g}")
+print(
+    f"Spawn region: x=[{spawnXMin:.4g},{spawnXMax:.4g}] "
+    f"y=[{spawnYMin:.4g},{spawnYMax:.4g}] z={spawnZ:.4g}"
+)
+
+
+# ============================================================
+# COMPRESSED-BED RECONSTRUCTION AND POSE EXPORT
+# ============================================================
+
+rockCounter = 0
+lastInsertionIter = None
+
+# Cumulative wall-clock time spent specifically in O.bodies.clump(...).
+# This is accumulated over every inserted rock in this simulation.
+clumpingTimeSeconds = 0.0
+clumpingCallCount = 0
+rockTypeByBodyId = {}
+rockTypeByClumpId = {}
+insertedRockTypeSequence = []
+localComByClumpId = {}
+initialOriByClumpId = {}
+rockScaleByClumpId = {}
+deletedRockCount = 0
+deletedRockIds = []
+export.rockTypeByBodyId = rockTypeByBodyId
+
+
+def quaternion_to_matrix(qx, qy, qz, qw):
+    quaternion = np.asarray([qx, qy, qz, qw], dtype=float)
+    norm = np.linalg.norm(quaternion)
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise RuntimeError("A saved rock pose contains an invalid quaternion.")
+    qx, qy, qz, qw = quaternion / norm
+    return np.asarray([
+        [1.0 - 2.0 * (qy*qy + qz*qz), 2.0 * (qx*qy - qz*qw), 2.0 * (qx*qz + qy*qw)],
+        [2.0 * (qx*qy + qz*qw), 1.0 - 2.0 * (qx*qx + qz*qz), 2.0 * (qy*qz - qx*qw)],
+        [2.0 * (qx*qz - qy*qw), 2.0 * (qy*qz + qx*qw), 1.0 - 2.0 * (qx*qx + qy*qy)],
+    ])
+
+
+def matrix_to_quaternion(rotation):
+    """Return normalized (qx, qy, qz, qw) for a proper rotation matrix."""
+    matrix = np.asarray(rotation, dtype=float)
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * scale
+        qx = (matrix[2, 1] - matrix[1, 2]) / scale
+        qy = (matrix[0, 2] - matrix[2, 0]) / scale
+        qz = (matrix[1, 0] - matrix[0, 1]) / scale
+    else:
+        diagonal = np.diag(matrix)
+        index = int(np.argmax(diagonal))
+        if index == 0:
+            scale = math.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+            qx = 0.25 * scale
+            qy = (matrix[0, 1] + matrix[1, 0]) / scale
+            qz = (matrix[0, 2] + matrix[2, 0]) / scale
+            qw = (matrix[2, 1] - matrix[1, 2]) / scale
+        elif index == 1:
+            scale = math.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+            qx = (matrix[0, 1] + matrix[1, 0]) / scale
+            qy = 0.25 * scale
+            qz = (matrix[1, 2] + matrix[2, 1]) / scale
+            qw = (matrix[0, 2] - matrix[2, 0]) / scale
+        else:
+            scale = math.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+            qx = (matrix[0, 2] + matrix[2, 0]) / scale
+            qy = (matrix[1, 2] + matrix[2, 1]) / scale
+            qz = 0.25 * scale
+            qw = (matrix[1, 0] - matrix[0, 1]) / scale
+    quaternion = np.asarray([qx, qy, qz, qw], dtype=float)
+    quaternion /= np.linalg.norm(quaternion)
+    return tuple(float(value) for value in quaternion)
+
+
+def read_source_final_poses():
+    pose_path = SOURCE_RUN_DIR / "rock_poses.csv"
+    deleted_path = SOURCE_RUN_DIR / "deleted_rocks.csv"
+    poses = pd.read_csv(pose_path)
+    required = {
+        "iter", "clumpId", "rockType", "x", "y", "z",
+        "qx", "qy", "qz", "qw", "localComX", "localComY", "localComZ",
+        "q0x", "q0y", "q0z", "q0w", "rockScale",
+    }
+    missing = required - set(poses.columns)
+    if missing:
+        raise RuntimeError(
+            "Source rock_poses.csv is missing: " + ", ".join(sorted(missing))
+        )
+    if poses.empty:
+        raise RuntimeError("Source rock_poses.csv contains no rock poses.")
+
+    deleted_ids = set()
+    deleted = pd.read_csv(deleted_path)
+    if not deleted.empty:
+        if "clumpId" not in deleted.columns:
+            raise RuntimeError("Source deleted_rocks.csv has no clumpId column.")
+        deleted_ids = set(pd.to_numeric(deleted["clumpId"], errors="raise").astype(int))
+
+    poses = poses.sort_values(["clumpId", "iter"]).groupby("clumpId", as_index=False).tail(1)
+    poses["clumpId"] = pd.to_numeric(poses["clumpId"], errors="raise").astype(int)
+    poses = poses.loc[~poses["clumpId"].isin(deleted_ids)].copy()
+    poses = poses.sort_values("clumpId").reset_index(drop=True)
+    if poses.empty:
+        raise RuntimeError("No retained rocks remain after applying deleted_rocks.csv.")
+    return poses
+
+
+def validate_source_metadata(source_poses):
+    source_metrics = sourceCompressionMetrics
+
+    expected_count = int(source_metrics["nRocksRetainedInYade"])
+    if len(source_poses) != expected_count:
+        raise RuntimeError(
+            "Source retained-rock mismatch: final poses contain {} but yade_metrics.csv records {}."
+            .format(len(source_poses), expected_count)
+        )
+
+    comparisons = {
+        "rockYoung": float(table.rockYoung),
+        "rockPoisson": float(table.rockPoisson),
+        "rockFrictionCoefficient": ROCK_FRICTION_COEFFICIENT,
+        "rockDensity": ROCK_DENSITY,
+        "boxYoung": float(table.boxYoung),
+        "boxPoisson": float(table.boxPoisson),
+        "boxFrictionCoefficient": BOX_FRICTION_COEFFICIENT,
+        "boxDensity": float(table.boxDensity),
+        "boxHalfExtentXYFracL": BOX_HALF_EXTENT_XY_FRAC_L,
+        "boxHalfExtentZFracL": BOX_HALF_EXTENT_Z_FRAC_L,
+        "compressionWidthReductionFrac": COMPRESSION_WIDTH_REDUCTION_FRAC,
+    }
+    for column, current_value in comparisons.items():
+        if column not in source_metrics.index:
+            raise RuntimeError("Source yade_metrics.csv is missing " + column)
+        source_value = float(source_metrics[column])
+        if not np.isclose(source_value, current_value, rtol=1.0e-10, atol=1.0e-12):
+            raise RuntimeError(
+                "Restart setting mismatch for {}: source={}, current={}".format(
+                    column, source_value, current_value
+                )
+            )
+
+    source_templates = pd.read_csv(SOURCE_RUN_DIR / "clump_template_configurations.csv")
+    current_templates = pd.DataFrame(template_rows)
+    for rock_type in range(1, 5):
+        source_row = source_templates.loc[source_templates["rockType"] == rock_type]
+        current_row = current_templates.loc[current_templates["rockType"] == rock_type]
+        if len(source_row) != 1 or len(current_row) != 1:
+            raise RuntimeError("Template metadata must contain one row for each rock type.")
+        for column in ("resolutionDivisor", "memberSphereCount"):
+            if int(source_row.iloc[0][column]) != int(current_row.iloc[0][column]):
+                raise RuntimeError("Source/current template mismatch for rock {} {}.".format(rock_type, column))
+        for column in ("overlapDepthFractionOfRadius", "memberRadius", "memberGap"):
+            if not np.isclose(float(source_row.iloc[0][column]), float(current_row.iloc[0][column]), rtol=1.0e-10, atol=1.0e-12):
+                raise RuntimeError("Source/current template mismatch for rock {} {}.".format(rock_type, column))
+        if str(source_row.iloc[0]["latticeRotation"]) != str(current_row.iloc[0]["latticeRotation"]):
+            raise RuntimeError("Source/current lattice rotation mismatch for rock {}.".format(rock_type))
+
+    expected_wall_displacement = float(
+        source_metrics["compressionTotalDisplacementPerWall"]
+    )
+    actual_wall_displacements = np.asarray([
+        SOURCE_BOX_X_MIN - TARGET_BOX_X_MIN,
+        TARGET_BOX_X_MAX - SOURCE_BOX_X_MAX,
+        SOURCE_BOX_Y_MIN - TARGET_BOX_Y_MIN,
+        TARGET_BOX_Y_MAX - SOURCE_BOX_Y_MAX,
+    ], dtype=float)
+    if np.any(actual_wall_displacements <= 0.0):
+        raise RuntimeError("Every lateral source wall must be inside its original bound.")
+    if not np.allclose(
+        actual_wall_displacements,
+        expected_wall_displacement,
+        rtol=1.0e-8,
+        atol=1.0e-10,
+    ):
+        raise RuntimeError(
+            "Stored compressed/original bounds do not match the source "
+            "compression displacement per wall."
+        )
+    return source_metrics
+
+
+def rebuild_saved_compressed_bed(source_poses):
+    """Create clumps directly at the final compressed-pose member positions."""
+    global rockCounter, lastInsertionIter, nRocks
+    global clumpingTimeSeconds, clumpingCallCount
+
+    maximum_com_error = 0.0
+    for _, row in source_poses.iterrows():
+        rock_type = int(row["rockType"])
+        if rock_type not in range(1, len(spherePacks) + 1):
+            raise RuntimeError("Invalid source rock type: {}".format(rock_type))
+        template_pack = spherePacks[rock_type - 1]
+        rock_scale = float(row["rockScale"])
+        position = np.asarray([row["x"], row["y"], row["z"]], dtype=float)
+        local_com = np.asarray(
+            [row["localComX"], row["localComY"], row["localComZ"]], dtype=float
+        )
+        final_rotation = quaternion_to_matrix(row["qx"], row["qy"], row["qz"], row["qw"])
+        initial_rotation = quaternion_to_matrix(row["q0x"], row["q0y"], row["q0z"], row["q0w"])
+        source_transform = final_rotation @ initial_rotation.T
+
+        rebuilt_spheres = []
+        for member in template_pack:
+            raw_position = rock_scale * np.asarray([
+                member.state.pos[0], member.state.pos[1], member.state.pos[2]
+            ], dtype=float)
+            final_member_position = position + source_transform @ (raw_position - local_com)
+            rebuilt_spheres.append(
+                sphere(
+                    Vector3(*final_member_position),
+                    rock_scale * member.shape.radius,
+                    material=matId_rock,
+                )
+            )
+        member_ids = O.bodies.append(rebuilt_spheres)
+        for member_id in member_ids:
+            rockTypeByBodyId[member_id] = rock_type
+
+        clump_start = time.perf_counter()
+        clump_id = O.bodies.clump(member_ids)
+        clumpingTimeSeconds += time.perf_counter() - clump_start
+        clumpingCallCount += 1
+        clump = O.bodies[clump_id]
+        clump.state.vel = Vector3(0, 0, 0)
+        clump.state.angVel = Vector3(0, 0, 0)
+
+        rebuilt_com = np.asarray([
+            clump.state.pos[0], clump.state.pos[1], clump.state.pos[2]
+        ], dtype=float)
+        com_error = np.linalg.norm(rebuilt_com - position)
+        maximum_com_error = max(maximum_com_error, float(com_error))
+        if com_error > 1.0e-7 * L:
+            raise RuntimeError(
+                "Rebuilt clump center differs from source pose by {} m.".format(com_error)
+            )
+
+        rebuilt_initial_rotation = quaternion_to_matrix(
+            clump.state.ori[0], clump.state.ori[1], clump.state.ori[2], clump.state.ori[3]
+        )
+        synthetic_q0 = matrix_to_quaternion(source_transform.T @ rebuilt_initial_rotation)
+        localComByClumpId[clump_id] = tuple(float(value) for value in local_com)
+        initialOriByClumpId[clump_id] = synthetic_q0
+        rockTypeByClumpId[clump_id] = rock_type
+        insertedRockTypeSequence.append(rock_type)
+        rockScaleByClumpId[clump_id] = rock_scale
+        rockCounter += 1
+
+    nRocks = rockCounter
+    lastInsertionIter = O.iter
+    print("Rebuilt", rockCounter, "retained rocks from", SOURCE_RUN_DIR)
+    print("Maximum reconstructed clump-center error =", maximum_com_error)
+
+
+sourceFinalPoses = read_source_final_poses()
+sourceCompressionMetrics = validate_source_metadata(sourceFinalPoses)
+rebuild_saved_compressed_bed(sourceFinalPoses)
+
+poseFile = open(RUN_DIR / "rock_poses.csv", "w")
+poseFile.write(
+    "iter,clumpId,rockType,x,y,z,qx,qy,qz,qw,"
+    "localComX,localComY,localComZ,q0x,q0y,q0z,q0w,rockScale\n"
+)
+
+residualFile = open(RUN_DIR / "residuals.csv", "w")
+residualFile.write(
+    "iter,time,unbalancedForce,kineticEnergy,kineticEnergyOverDensity,"
+    "settledConsecutiveSteps,relaxationFraction,relaxationDisplacement,"
+    "wallForceMagnitude,phase\n"
+)
+
+deletedRockFile = open(RUN_DIR / "deleted_rocks.csv", "w")
+deletedRockFile.write(
+    "iter,time,clumpId,rockType,centerX,centerY,centerZ,"
+    "lowestMemberSurfaceZ,currentBoxFloorZ,escapeThresholdZ,"
+    "safetyMargin,safetyMarginFracL,reason\n"
+)
+
+
+def exportClumpPoses():
+    for body in O.bodies:
+        if not body or not body.isClump:
+            continue
+
+        q = body.state.ori
+        rock_type = rockTypeByClumpId.get(body.id, -1)
+        local_com = localComByClumpId[body.id]
+        q0 = initialOriByClumpId[body.id]
+        rock_scale = rockScaleByClumpId[body.id]
+
+        poseFile.write(
+            f"{O.iter},{body.id},{rock_type},"
+            f"{body.state.pos[0]},{body.state.pos[1]},{body.state.pos[2]},"
+            f"{q[0]},{q[1]},{q[2]},{q[3]},"
+            f"{local_com[0]},{local_com[1]},{local_com[2]},"
+            f"{q0[0]},{q0[1]},{q0[2]},{q0[3]},{rock_scale}\n"
+        )
+
+    poseFile.flush()
+
+
+# ============================================================
+# BOX FACET HELPERS (USED BY RELAXATION AND FINAL BOUNDS)
+# ============================================================
+
+wallAxisSign = {}
+
+
+def facet_global_vertices(bid):
+    body = O.bodies[bid]
+    return [body.state.pos + body.state.ori * vertex for vertex in body.shape.vertices]
+
+
+def classify_wall(bid):
+    """Return (axis, outward sign) for an axis-aligned box facet."""
+    v0, v1, v2 = facet_global_vertices(bid)
+    normal = (v1 - v0).cross(v2 - v0)
+    normal = normal / normal.norm()
+    centroid = (v0 + v1 + v2) / 3.0
+
+    if normal.dot(centroid - BOX_CENTER) < 0:
+        normal = -normal
+
+    axis = max(range(3), key=lambda i: abs(normal[i]))
+    sign = 1 if normal[axis] > 0 else -1
+    return axis, sign
+
+
+for box_id in boxIds:
+    wallAxisSign[box_id] = (
+        (2, 1)
+        if box_id in sourceCompressionLidIds
+        else classify_wall(box_id)
+    )
+
+
+def plane_coordinate(axis, sign, fallback):
+    values = []
+    for bid in boxIds:
+        if wallAxisSign.get(bid) != (axis, sign):
+            continue
+        vertices = facet_global_vertices(bid)
+        values.extend(float(vertex[axis]) for vertex in vertices)
+    return float(np.mean(values)) if values else float(fallback)
+
+
+def current_box_bounds():
+    return {
+        "boxXMin": plane_coordinate(0, -1, initialBoxXMin),
+        "boxXMax": plane_coordinate(0, 1, initialBoxXMax),
+        "boxYMin": plane_coordinate(1, -1, initialBoxYMin),
+        "boxYMax": plane_coordinate(1, 1, initialBoxYMax),
+        "boxFloorZ": plane_coordinate(2, -1, initialBoxFloorZ),
+        "boxTopZ": plane_coordinate(2, 1, initialBoxTopZ),
+    }
+
+
+ESCAPE_BELOW_FLOOR_MARGIN = ESCAPE_BELOW_FLOOR_MARGIN_FRAC_L * L
+
+
+def eraseClumpsBelowFloorEnvelope():
+    """Erase complete clumps whose member geometry escaped below the floor."""
+    global deletedRockCount
+
+    floor_z = current_box_bounds()["boxFloorZ"]
+    threshold_z = floor_z - ESCAPE_BELOW_FLOOR_MARGIN
+
+    minimum_surface_z = {}
+    member_ids_by_clump = {}
+
+    # Test actual member-sphere surfaces rather than only the clump centre.
+    # Collect IDs first; bodies are erased only after this traversal finishes.
+    for body in O.bodies:
+        if not body or not isinstance(body.shape, Sphere):
+            continue
+
+        clump_id = int(body.clumpId)
+        if clump_id < 0 or clump_id not in rockTypeByClumpId:
+            continue
+
+        surface_z = float(body.state.pos[2] - body.shape.radius)
+        previous = minimum_surface_z.get(clump_id)
+        if previous is None or surface_z < previous:
+            minimum_surface_z[clump_id] = surface_z
+        member_ids_by_clump.setdefault(clump_id, []).append(body.id)
+
+    escaped_clump_ids = sorted(
+        clump_id
+        for clump_id, surface_z in minimum_surface_z.items()
+        if surface_z < threshold_z
+    )
+
+    for clump_id in escaped_clump_ids:
+        clump = O.bodies[clump_id]
+        if not clump:
+            continue
+
+        rock_type = rockTypeByClumpId.get(clump_id, -1)
+        center = Vector3(clump.state.pos)
+        lowest_z = minimum_surface_z[clump_id]
+
+        # YADE requires True here to erase the clump body AND every member.
+        erased = O.bodies.erase(clump_id, True)
+        if not erased:
+            print("WARNING: YADE could not erase escaped clump", clump_id)
+            continue
+
+        deletedRockFile.write(
+            f"{O.iter},{O.time},{clump_id},{rock_type},"
+            f"{center[0]},{center[1]},{center[2]},"
+            f"{lowest_z},{floor_z},{threshold_z},"
+            f"{ESCAPE_BELOW_FLOOR_MARGIN},"
+            f"{ESCAPE_BELOW_FLOOR_MARGIN_FRAC_L},below_floor_envelope\n"
+        )
+        deletedRockFile.flush()
+
+        for member_id in member_ids_by_clump.get(clump_id, []):
+            rockTypeByBodyId.pop(member_id, None)
+
+        rockTypeByClumpId.pop(clump_id, None)
+        localComByClumpId.pop(clump_id, None)
+        initialOriByClumpId.pop(clump_id, None)
+        rockScaleByClumpId.pop(clump_id, None)
+        deletedRockIds.append(clump_id)
+        deletedRockCount += 1
+
+        print(
+            "ERASED ESCAPED ROCK | clumpId =", clump_id,
+            "| rockType =", rock_type,
+            "| lowest surface z =", lowest_z,
+            "| floor envelope z =", threshold_z,
+            "| retained rocks =", len(rockTypeByClumpId),
+        )
+
+
+# ============================================================
+# VTK EXPORT
+# ============================================================
+
+for pattern in ("scene*.vtk", "scene*.vtu"):
+    for stale_vtk_file in RUN_DIR.glob(pattern):
+        stale_vtk_file.unlink()
+
+vtkExporter = export.VTKExporter(str(RUN_DIR / "scene"))
+
+
+def exportVTK():
+    # Give spheres and facets the same physical iteration label so ParaView
+    # cannot pair the box with the wrong rock frame.
+    vtkExporter.exportSpheres(
+        what={"rockType": "rockTypeByBodyId.get(b.id,0)"},
+        numLabel=O.iter,
+    )
+    vtkExporter.exportFacets(numLabel=O.iter)
+
+
+# ============================================================
+# ENGINES
+# ============================================================
+
+engines = [
+    ForceResetter(),
+    InsertionSortCollider([
+        Bo1_Sphere_Aabb(),
+        Bo1_Facet_Aabb(),
+    ]),
+    InteractionLoop(
+        [
+            Ig2_Sphere_Sphere_ScGeom(),
+            Ig2_Facet_Sphere_ScGeom(),
+        ],
+        contact_ip2,
+        contact_law2,
+    ),
+    NewtonIntegrator(
+        gravity=(0, 0, -9.81),
+        damping=NEWTON_DAMPING,
+        exactAsphericalRot=True,
+    ),
+    PyRunner(
+        command="eraseClumpsBelowFloorEnvelope()",
+        iterPeriod=ESCAPE_CHECK_PERIOD,
+    ),
+]
+
+if VTK_EXPORT_PERIOD > 0:
+    engines.append(PyRunner(command="exportVTK()", iterPeriod=VTK_EXPORT_PERIOD))
+
+engines.extend([
+    PyRunner(command="exportClumpPoses()", iterPeriod=POSE_EXPORT_PERIOD),
+    PyRunner(command="addPlotData()", iterPeriod=RESIDUAL_EXPORT_PERIOD),
+    PyRunner(command="controlSimulation()", iterPeriod=1),
+])
+
+O.engines = engines
+O.dt = TIMESTEP_SAFETY * PWaveTimeStep()
+
+print(
+    "Maximum iterations after final insertion =",
+    MAXIMUM_ITERATIONS_AFTER_LAST_INSERTION,
+)
+
+
+# ============================================================
+# OPTIONAL VIBRATION
+# ============================================================
+
+axisIndex = {"x": 0, "y": 1, "z": 2}[VIBRATION_AXIS]
+boxSizeAlongVibrationAxis = [
+    INITIAL_BOX_WIDTH_X,
+    INITIAL_BOX_WIDTH_Y,
+    INITIAL_BOX_HEIGHT,
+][axisIndex]
+VIB_AMPLITUDE = VIB_AMPLITUDE_FRAC * boxSizeAlongVibrationAxis
+
+vibrationStartIter = None
+currentVibrationDisplacement = 0.0
+
+
+def vibration_envelope(k):
+    ramp_steps = min(VIBRATION_RAMP_STEPS, VIBRATION_STEPS // 2)
+    if ramp_steps <= 0:
+        return 1.0
+    if k < ramp_steps:
+        return k / ramp_steps
+    if k > VIBRATION_STEPS - ramp_steps:
+        return max(0.0, (VIBRATION_STEPS - k) / ramp_steps)
+    return 1.0
+
+
+def moveBoxSinusoidal():
+    global currentVibrationDisplacement
+
+    k = O.iter - vibrationStartIter
+    omega_iter = 2.0 * np.pi / VIB_PERIOD_STEPS
+    displacement = (
+        VIB_AMPLITUDE
+        * vibration_envelope(k)
+        * np.sin(omega_iter * k)
+    )
+    velocity = (displacement - currentVibrationDisplacement) / O.dt
+    currentVibrationDisplacement = displacement
+
+    displacement_vector = Vector3(0, 0, 0)
+    velocity_vector = Vector3(0, 0, 0)
+    displacement_vector[axisIndex] = displacement
+    velocity_vector[axisIndex] = velocity
+
+    for bid in boxIds:
+        body = O.bodies[bid]
+        body.state.pos = boxInitialPos[bid] + displacement_vector
+        body.state.vel = velocity_vector
+        body.state.angVel = Vector3(0, 0, 0)
+
+
+def stopBoxMotion():
+    global currentVibrationDisplacement
+    currentVibrationDisplacement = 0.0
+
+    for bid in boxIds:
+        body = O.bodies[bid]
+        body.state.pos = Vector3(boxInitialPos[bid])
+        body.state.vel = Vector3(0, 0, 0)
+        body.state.angVel = Vector3(0, 0, 0)
+
+
+def vibration_peak_acceleration():
+    if not ENABLE_VIBRATION:
+        return 0.0
+    omega_physical = 2.0 * np.pi / (VIB_PERIOD_STEPS * O.dt)
+    return VIB_AMPLITUDE * omega_physical ** 2
+
+
+# ============================================================
+# LATERAL-WALL RELAXATION TO THE ORIGINAL BOX WIDTH
+# ============================================================
+
+relaxationStartIter = None
+previousRelaxationFraction = 0.0
+currentRelaxationFraction = 0.0
+currentRelaxationDisplacement = 0.0
+
+targetCoordinateByWall = {
+    (0, -1): TARGET_BOX_X_MIN,
+    (0, 1): TARGET_BOX_X_MAX,
+    (1, -1): TARGET_BOX_Y_MIN,
+    (1, 1): TARGET_BOX_Y_MAX,
+}
+relaxWall = {}
+relaxationDeltaByWall = {}
+
+for bid in boxIds:
+    axis, sign = wallAxisSign[bid]
+    relaxWall[bid] = axis in (0, 1)
+    if not relaxWall[bid]:
+        relaxationDeltaByWall[bid] = 0.0
+        continue
+    start_coordinate = plane_coordinate(axis, sign, 0.0)
+    target_coordinate = targetCoordinateByWall[(axis, sign)]
+    delta = target_coordinate - start_coordinate
+    if sign * delta <= 0.0:
+        raise RuntimeError(
+            "Wall ({}, {}) does not move outward: start={}, target={}."
+            .format(axis, sign, start_coordinate, target_coordinate)
+        )
+    relaxationDeltaByWall[bid] = delta
+
+RELAXATION_TOTAL_DISPLACEMENT_PER_WALL = float(np.mean([
+    abs(relaxationDeltaByWall[bid])
+    for bid in boxIds if relaxWall[bid]
+]))
+
+
+def totalWallForceMagnitude():
+    return sum(O.forces.f(bid).norm() for bid in boxIds)
+
+
+def smoothstep(t):
+    t = min(1.0, max(0.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def applyRelaxationStep():
+    global previousRelaxationFraction, currentRelaxationFraction
+    global currentRelaxationDisplacement
+
+    k = O.iter - relaxationStartIter
+    fraction = smoothstep(k / RELAXATION_STEPS)
+    delta_fraction = fraction - previousRelaxationFraction
+    previousRelaxationFraction = fraction
+    currentRelaxationFraction = fraction
+    currentRelaxationDisplacement = (
+        RELAXATION_TOTAL_DISPLACEMENT_PER_WALL * fraction
+    )
+
+    for bid in boxIds:
+        if not relaxWall.get(bid, False):
+            continue
+
+        axis, _ = wallAxisSign[bid]
+        total_delta = relaxationDeltaByWall[bid]
+        body = O.bodies[bid]
+        position = Vector3(boxInitialPos[bid])
+        position[axis] += total_delta * fraction
+
+        velocity = Vector3(0, 0, 0)
+        velocity[axis] = total_delta * delta_fraction / O.dt
+
+        body.state.pos = position
+        body.state.vel = velocity
+        body.state.angVel = Vector3(0, 0, 0)
+
+
+def holdWallsAtOriginalBounds():
+    global currentRelaxationFraction, currentRelaxationDisplacement
+    currentRelaxationFraction = 1.0
+    currentRelaxationDisplacement = RELAXATION_TOTAL_DISPLACEMENT_PER_WALL
+
+    for bid in boxIds:
+        body = O.bodies[bid]
+        position = Vector3(boxInitialPos[bid])
+        if relaxWall.get(bid, False):
+            axis, _ = wallAxisSign[bid]
+            position[axis] += relaxationDeltaByWall[bid]
+
+        body.state.pos = position
+        body.state.vel = Vector3(0, 0, 0)
+        body.state.angVel = Vector3(0, 0, 0)
+
+
+def removeSourceCompressionLid():
+    """Restore the original open-top boundary after the lateral-wall ramp."""
+    if not sourceCompressionLidIds:
+        return
+
+    for bid in list(sourceCompressionLidIds):
+        if O.bodies[bid]:
+            O.bodies.erase(bid)
+        if bid in boxIds:
+            boxIds.remove(bid)
+        wallAxisSign.pop(bid, None)
+        relaxWall.pop(bid, None)
+        relaxationDeltaByWall.pop(bid, None)
+        boxInitialPos.pop(bid, None)
+    sourceCompressionLidIds[:] = []
+    print("Removed the reconstructed compression lid; box is open-top again.")
+
+
+# ============================================================
+# FINAL DIAGNOSTICS AND METRICS
+# ============================================================
+
+
+def finalOverlapCheck():
+    """Evaluate the current sphere-sphere overlap once at the end of the run."""
+    # YADE's utility considers ScGeom interactions between two spheres; facet
+    # contacts are therefore not included. For radii r1 and r2 it normalizes
+    # penetration uN by 2*r1*r2/(r1+r2), which equals r for equal radii.
+    sphere_sphere_ratio = float(utils.maxOverlapRatio())
+    criterion_satisfied = (
+        sphere_sphere_ratio <= MAXIMUM_ALLOWED_OVERLAP_FRACTION
+    )
+
+    print("\nFINAL SETTLED SPHERE-SPHERE OVERLAP CHECK")
+    print(
+        "YADE maximum overlap ratio =", sphere_sphere_ratio,
+        "=", 100.0 * sphere_sphere_ratio, "%",
+        "| limit =", 100.0 * MAXIMUM_ALLOWED_OVERLAP_FRACTION,
+        "% | criterion satisfied =", criterion_satisfied,
+    )
+
+    return {
+        "finalSphereSphereMaxOverlapRatio": sphere_sphere_ratio,
+        "finalSphereSphereMaxOverlapPercent": 100.0 * sphere_sphere_ratio,
+        "overlapMeasurementIteration": O.iter,
+        "overlapMeasurementTime": O.time,
+        "maximumAllowedOverlapFraction": MAXIMUM_ALLOWED_OVERLAP_FRACTION,
+        "maximumAllowedOverlapPercent": (
+            100.0 * MAXIMUM_ALLOWED_OVERLAP_FRACTION
+        ),
+        "overlapCriterionSatisfied": criterion_satisfied,
+    }
+
+
+def count_final_bodies():
+    n_clumps = 0
+    n_spheres = 0
+    n_facets = 0
+
+    for body in O.bodies:
+        if not body:
+            continue
+        if body.isClump:
+            n_clumps += 1
+        elif isinstance(body.shape, Sphere):
+            n_spheres += 1
+        elif isinstance(body.shape, Facet):
+            n_facets += 1
+
+    return n_clumps, n_spheres, n_facets
+
+
+def simulation_mode_name():
+    return "compressed_restart_wall_relaxation_to_original_bounds"
+
+
+def engine_display_name(engine, index):
+    """Human-readable unique name, including PyRunner command when available."""
+    class_name = engine.__class__.__name__
+    command = getattr(engine, "command", "")
+    if command:
+        return f"{index:02d}_{class_name}[{command}]"
+    return f"{index:02d}_{class_name}"
+
+
+def write_engine_timing():
+    """Write cumulative YADE engine timing for this simulation run."""
+    rows = []
+    for index, engine in enumerate(O.engines):
+        exec_time_ns = float(getattr(engine, "execTime", 0.0))
+        exec_count = int(getattr(engine, "execCount", 0))
+        total_seconds = exec_time_ns / 1.0e9
+        average_ms = (exec_time_ns / exec_count / 1.0e6) if exec_count else np.nan
+
+        rows.append({
+            "run_id": RUN_ID,
+            "engineIndex": index,
+            "engine": engine_display_name(engine, index),
+            "engineClass": engine.__class__.__name__,
+            "execCount": exec_count,
+            "totalTimeSeconds": total_seconds,
+            "averageTimePerCallMs": average_ms,
+        })
+
+    total_engine_seconds = sum(row["totalTimeSeconds"] for row in rows)
+    for row in rows:
+        row["percentOfMeasuredEngineTime"] = (
+            100.0 * row["totalTimeSeconds"] / total_engine_seconds
+            if total_engine_seconds > 0 else np.nan
+        )
+
+    timing_df = pd.DataFrame(rows)
+    timing_path = RUN_DIR / "engine_timing.csv"
+    timing_df.to_csv(timing_path, index=False)
+
+    print("\n========== YADE ENGINE TIMING ==========")
+    for row in rows:
+        print(
+            f"{row['engine']}: "
+            f"total={row['totalTimeSeconds']:.6f} s, "
+            f"calls={row['execCount']}, "
+            f"avg={row['averageTimePerCallMs']:.6f} ms/call, "
+            f"share={row['percentOfMeasuredEngineTime']:.2f}%"
+        )
+    print(f"Measured engine total = {total_engine_seconds:.6f} s")
+    print("Saved:", timing_path)
+
+    return total_engine_seconds
+
+
+def write_yade_metrics(
+    final_unbalanced_force,
+    overlap_metrics,
+    finish_reason,
+    equilibrium_reached,
+):
+    wall_clock_time = time.time() - wall_time_start
+    n_clumps, n_spheres, n_facets = count_final_bodies()
+    iterations_per_second = O.iter / wall_clock_time if wall_clock_time > 0 else np.nan
+
+    final_kinetic_energy = utils.kineticEnergy()
+    final_kinetic_energy_over_density = final_kinetic_energy / ROCK_DENSITY
+    final_bounds = current_box_bounds()
+
+    metrics = pd.DataFrame([{
+        "run_id": RUN_ID,
+        "description": str(table.description),
+        "sourceCompressionRunId": SOURCE_RUN_ID,
+        "sourceCompressionRunDirectory": str(SOURCE_RUN_DIR),
+        "upstreamGravityRunId": sourceCompressionMetrics.get(
+            "sourceGravityRunId", np.nan
+        ),
+        "initializationMode": "reconstructed_from_final_compressed_poses",
+        "contactHistoryRestored": False,
+        "velocitiesRestored": False,
+        "initialContactRelaxationApplied": True,
+        "sourceRetainedRockCount": len(sourceFinalPoses),
+        "spawnSeed": SPAWN_SEED,
+        "rockTypeSeed": ROCK_TYPE_SEED,
+        "simulationMode": simulation_mode_name(),
+        "spawnMode": SPAWN_MODE,
+        "rockSelectionMode": ROCK_SELECTION_MODE,
+        "contactModel": "Hertz-Mindlin",
+        "wallClockTimeSeconds": wall_clock_time,
+        "finalIteration": O.iter,
+        "finalSimulationTime": O.time,
+        "finishReason": finish_reason,
+        "equilibriumReached": equilibrium_reached,
+        "lastInsertionIteration": lastInsertionIter,
+        "iterationsSinceLastInsertion": (
+            O.iter - lastInsertionIter if lastInsertionIter is not None else np.nan
+        ),
+        "iterationsPerSecond": iterations_per_second,
+        "finalUnbalancedForce": final_unbalanced_force,
+        "finalKineticEnergy": final_kinetic_energy,
+        "rockDensity": ROCK_DENSITY,
+        "rockYoung": float(table.rockYoung),
+        "rockPoisson": float(table.rockPoisson),
+        "rockFrictionCoefficient": ROCK_FRICTION_COEFFICIENT,
+        "rockFrictionAngleRadians": rockMat.frictionAngle,
+        "rockFrictionAngleDegrees": math.degrees(rockMat.frictionAngle),
+        "boxDensity": float(table.boxDensity),
+        "boxYoung": float(table.boxYoung),
+        "boxPoisson": float(table.boxPoisson),
+        "boxFrictionCoefficient": BOX_FRICTION_COEFFICIENT,
+        "boxFrictionAngleRadians": boxMat.frictionAngle,
+        "boxFrictionAngleDegrees": math.degrees(boxMat.frictionAngle),
+        "finalKineticEnergyOverDensity": final_kinetic_energy_over_density,
+        "settleUbThreshold": SETTLE_UB_THRESHOLD,
+        "finalUbThreshold": FINAL_UB_THRESHOLD,
+        "settleHoldSteps": SETTLE_HOLD_STEPS,
+        "minimumSettlingSteps": MINIMUM_SETTLING_STEPS,
+        "maximumIterationsAfterLastInsertion": (
+            MAXIMUM_ITERATIONS_AFTER_LAST_INSERTION
+        ),
+        "escapeBelowFloorMarginFracL": ESCAPE_BELOW_FLOOR_MARGIN_FRAC_L,
+        "escapeBelowFloorMargin": ESCAPE_BELOW_FLOOR_MARGIN,
+        "escapeCheckPeriod": ESCAPE_CHECK_PERIOD,
+        "newtonDamping": NEWTON_DAMPING,
+        "timestepSafety": TIMESTEP_SAFETY,
+        "timeStep": O.dt,
+        "insertionPeriodSeconds": INSERTION_PERIOD_SECONDS,
+        "nRocksTarget": nRocks,
+        "nRocksInserted": rockCounter,
+        "nRocksErasedBelowFloor": deletedRockCount,
+        "nRocksRetainedInYade": len(rockTypeByClumpId),
+        "erasedClumpIds": ";".join(str(clump_id) for clump_id in deletedRockIds),
+        "insertedRockTypeSequence": ";".join(
+            str(rock_type) for rock_type in insertedRockTypeSequence
+        ),
+        "nClumps": n_clumps,
+        "nSpheres": n_spheres,
+        "nFacets": n_facets,
+        "L": L,
+        "boxHalfExtentXYFracL": BOX_HALF_EXTENT_XY_FRAC_L,
+        "boxHalfExtentZFracL": BOX_HALF_EXTENT_Z_FRAC_L,
+        "boxHalfExtentXY": BOX_HALF_EXTENT_XY,
+        "boxHalfExtentZ": BOX_HALF_EXTENT_Z,
+        "clumpingTimeSeconds": clumpingTimeSeconds,
+        "clumpingCallCount": clumpingCallCount,
+        "averageClumpingTimeSeconds": (
+            clumpingTimeSeconds / clumpingCallCount if clumpingCallCount else np.nan
+        ),
+        "porosityBoundaryMarginFracL": POROSITY_BOUNDARY_MARGIN_FRAC_L,
+
+        **overlap_metrics,
+
+        "totalTemplateSphereCount": sum(len(pack) for pack in spherePacks),
+        "meanTemplateSphereCount": float(np.mean([len(pack) for pack in spherePacks])),
+        "rock1ResolutionDivisor": SELECTED_CLUMP_CONFIGURATIONS[1]["divisor"],
+        "rock1OverlapFraction": SELECTED_CLUMP_CONFIGURATIONS[1]["overlapFraction"],
+        "rock1LatticeRotation": SELECTED_CLUMP_CONFIGURATIONS[1]["rotation"],
+        "rock1TemplateSphereCount": len(spherePacks[0]),
+        "rock2ResolutionDivisor": SELECTED_CLUMP_CONFIGURATIONS[2]["divisor"],
+        "rock2OverlapFraction": SELECTED_CLUMP_CONFIGURATIONS[2]["overlapFraction"],
+        "rock2LatticeRotation": SELECTED_CLUMP_CONFIGURATIONS[2]["rotation"],
+        "rock2TemplateSphereCount": len(spherePacks[1]),
+        "rock3ResolutionDivisor": SELECTED_CLUMP_CONFIGURATIONS[3]["divisor"],
+        "rock3OverlapFraction": SELECTED_CLUMP_CONFIGURATIONS[3]["overlapFraction"],
+        "rock3LatticeRotation": SELECTED_CLUMP_CONFIGURATIONS[3]["rotation"],
+        "rock3TemplateSphereCount": len(spherePacks[2]),
+        "rock4ResolutionDivisor": SELECTED_CLUMP_CONFIGURATIONS[4]["divisor"],
+        "rock4OverlapFraction": SELECTED_CLUMP_CONFIGURATIONS[4]["overlapFraction"],
+        "rock4LatticeRotation": SELECTED_CLUMP_CONFIGURATIONS[4]["rotation"],
+        "rock4TemplateSphereCount": len(spherePacks[3]),
+
+        "enableVibration": False,
+        "enableCompression": False,
+        "sourceCompressionWidthReductionFrac": float(
+            sourceCompressionMetrics["compressionWidthReductionFrac"]
+        ),
+        "sourceCompressionTotalDisplacementPerWall": float(
+            sourceCompressionMetrics["compressionTotalDisplacementPerWall"]
+        ),
+        "sourceCompressionSteps": int(sourceCompressionMetrics["compressionSteps"]),
+        "enableWallRelaxation": True,
+        "relaxationSteps": RELAXATION_STEPS,
+        "relaxationFraction": currentRelaxationFraction,
+        "relaxationDisplacementMeanPerWall": currentRelaxationDisplacement,
+        "relaxationTargetDisplacementMeanPerWall": (
+            RELAXATION_TOTAL_DISPLACEMENT_PER_WALL
+        ),
+        "compressionDisplacementRemaining": 0.0,
+        "compressionLidRecreatedForRestart": True,
+        "compressionLidRemovedBeforeFinalSettling": True,
+        "sourceCompressionLidZ": SOURCE_COMPRESSION_LID_Z,
+        "finalWallForceMagnitude": totalWallForceMagnitude(),
+
+        # Actual starting bounds for this restart are the compressed bounds.
+        "initialBoxXMin": initialBoxXMin,
+        "initialBoxXMax": initialBoxXMax,
+        "initialBoxYMin": initialBoxYMin,
+        "initialBoxYMax": initialBoxYMax,
+        "initialBoxFloorZ": initialBoxFloorZ,
+        "initialBoxTopZ": initialBoxTopZ,
+        "sourceCompressedBoxXMin": SOURCE_BOX_X_MIN,
+        "sourceCompressedBoxXMax": SOURCE_BOX_X_MAX,
+        "sourceCompressedBoxYMin": SOURCE_BOX_Y_MIN,
+        "sourceCompressedBoxYMax": SOURCE_BOX_Y_MAX,
+        "sourceCompressedBoxFloorZ": SOURCE_BOX_FLOOR_Z,
+        "sourceCompressedBoxTopZ": SOURCE_COMPRESSION_LID_Z,
+        "targetOriginalBoxXMin": TARGET_BOX_X_MIN,
+        "targetOriginalBoxXMax": TARGET_BOX_X_MAX,
+        "targetOriginalBoxYMin": TARGET_BOX_Y_MIN,
+        "targetOriginalBoxYMax": TARGET_BOX_Y_MAX,
+        "targetOriginalBoxFloorZ": TARGET_BOX_FLOOR_Z,
+        "targetOriginalBoxTopZ": TARGET_BOX_TOP_Z,
+        # These unprefixed fields are deliberately FINAL bounds because the
+        # STL contact/porosity post-processors consume them.
+        **final_bounds,
+    }])
+
+    metrics.to_csv(RUN_DIR / "yade_metrics.csv", index=False)
+    print("Saved: yade_metrics.csv")
+    print("Final box bounds used by post-processing:", final_bounds)
+
+
+# ============================================================
+# COMBINED PHASE CONTROLLER
+# ============================================================
+
+simPhase = "initial_settling"
+finished = False
+settledConsecutiveSteps = 0
+settlingPhaseStartIter = None
+
+
+def resetSettlingCheck(phase_start_iter):
+    global settledConsecutiveSteps, settlingPhaseStartIter
+    settledConsecutiveSteps = 0
+    settlingPhaseStartIter = phase_start_iter
+
+
+def externalContactedClumps():
+    """Return clump IDs currently touching another rock or a box facet."""
+    contacted = set()
+
+    for interaction in O.interactions:
+        if not interaction.isReal:
+            continue
+
+        body1 = O.bodies[interaction.id1]
+        body2 = O.bodies[interaction.id2]
+        if not body1 or not body2:
+            continue
+        body1_is_sphere = isinstance(body1.shape, Sphere)
+        body2_is_sphere = isinstance(body2.shape, Sphere)
+        clump1 = body1.clumpId if body1_is_sphere else -1
+        clump2 = body2.clumpId if body2_is_sphere else -1
+
+        if clump1 >= 0:
+            if isinstance(body2.shape, Facet) or (clump2 >= 0 and clump2 != clump1):
+                contacted.add(clump1)
+        if clump2 >= 0:
+            if isinstance(body1.shape, Facet) or (clump1 >= 0 and clump1 != clump2):
+                contacted.add(clump2)
+
+    return contacted
+
+
+def allRocksHaveExternalContact():
+    inserted_clumps = set(rockTypeByClumpId.keys())
+    return bool(inserted_clumps) and inserted_clumps.issubset(externalContactedClumps())
+
+
+def unbalancedForceHasSettled(unbalanced_force, threshold):
+    """Require minimum duration, current contacts, and sustained low residual."""
+    global settledConsecutiveSteps
+
+    if settlingPhaseStartIter is None:
+        return False
+
+    if O.iter - settlingPhaseStartIter < MINIMUM_SETTLING_STEPS:
+        settledConsecutiveSteps = 0
+        return False
+
+    if not np.isfinite(unbalanced_force) or unbalanced_force > threshold:
+        settledConsecutiveSteps = 0
+        return False
+
+    settledConsecutiveSteps += 1
+    if settledConsecutiveSteps < SETTLE_HOLD_STEPS:
+        return False
+
+    # Check the more expensive contact condition only when the residual has
+    # already remained low long enough to request a phase transition.
+    if not allRocksHaveExternalContact():
+        settledConsecutiveSteps = 0
+        return False
+
+    return True
+
+
+def startVibration(unbalanced_force, kinetic_energy):
+    global simPhase, vibrationStartIter, currentVibrationDisplacement
+    simPhase = "vibrating"
+    vibrationStartIter = O.iter
+    currentVibrationDisplacement = 0.0
+
+    print("\nSTARTING VIBRATION")
+    print("Axis =", VIBRATION_AXIS)
+    print("Amplitude =", VIB_AMPLITUDE)
+    print("Peak acceleration estimate =", vibration_peak_acceleration(), "m/s^2")
+    print("Start iteration =", O.iter)
+    print("Unbalanced force before vibration =", unbalanced_force)
+    print("Kinetic energy before vibration =", kinetic_energy, "J")
+
+
+def startRelaxation(unbalanced_force, kinetic_energy):
+    global simPhase, relaxationStartIter, previousRelaxationFraction
+
+    simPhase = "relaxing_walls"
+    relaxationStartIter = O.iter
+    previousRelaxationFraction = 0.0
+
+    print("\nSTARTING LATERAL-WALL RELAXATION")
+    print("Start iteration =", O.iter)
+    print("Unbalanced force before wall relaxation =", unbalanced_force)
+    print("Kinetic energy before wall relaxation =", kinetic_energy, "J")
+    print("Relaxation steps =", RELAXATION_STEPS)
+    print(
+        "Mean outward displacement per lateral wall =",
+        RELAXATION_TOTAL_DISPLACEMENT_PER_WALL,
+    )
+    print("Target x bounds =", TARGET_BOX_X_MIN, TARGET_BOX_X_MAX)
+    print("Target y bounds =", TARGET_BOX_Y_MIN, TARGET_BOX_Y_MAX)
+
+
+def finishSimulation(
+    final_unbalanced_force,
+    finish_reason="equilibrium",
+    equilibrium_reached=True,
+):
+    global finished
+
+    if finished:
+        return
+    if currentRelaxationFraction < 1.0:
+        raise RuntimeError(
+            "Refusing to export a relaxation result before the lateral walls "
+            "have reached their original bounds."
+        )
+    restored_bounds = current_box_bounds()
+    expected_bounds = {
+        "boxXMin": TARGET_BOX_X_MIN,
+        "boxXMax": TARGET_BOX_X_MAX,
+        "boxYMin": TARGET_BOX_Y_MIN,
+        "boxYMax": TARGET_BOX_Y_MAX,
+        "boxFloorZ": TARGET_BOX_FLOOR_Z,
+    }
+    for name, expected in expected_bounds.items():
+        if not np.isclose(
+            restored_bounds[name], expected, rtol=1.0e-10, atol=1.0e-10
+        ):
+            raise RuntimeError(
+                "Restored wall-bound check failed for {}: actual={}, target={}."
+                .format(name, restored_bounds[name], expected)
+            )
+    finished = True
+
+    if equilibrium_reached:
+        print("\nFINISHED: final equilibrium reached")
+    else:
+        print("\nFINISHED: post-insertion iteration allowance reached")
+    print("Finish reason =", finish_reason)
+    print("Simulation mode =", simulation_mode_name())
+    print("Final iteration =", O.iter)
+    print("Final simulation time =", O.time)
+    print("Final unbalanced force =", final_unbalanced_force)
+    print("Final kinetic energy =", utils.kineticEnergy(), "J")
+    print("Final relaxation fraction =", currentRelaxationFraction)
+    print(
+        "Final outward displacement per lateral wall =",
+        currentRelaxationDisplacement,
+    )
+
+    overlap_metrics = finalOverlapCheck()
+    exportClumpPoses()
+    exportVTK()
+
+    # Capture engine timing BEFORE launching external post-processing, so the
+    # engine numbers represent YADE simulation work only.
+    measured_engine_total = write_engine_timing()
+    write_yade_metrics(
+        final_unbalanced_force,
+        overlap_metrics,
+        finish_reason,
+        equilibrium_reached,
+    )
+
+    poseFile.close()
+    residualFile.close()
+    deletedRockFile.close()
+
+    reconstruct_seconds = np.nan
+    porosity_seconds = np.nan
+    post_processing_total_seconds = 0.0
+    post_processing_succeeded = np.nan if ENABLE_POST_PROCESSING else True
+
+    if ENABLE_POST_PROCESSING and DEFER_POST_PROCESSING_TO_RUNNER:
+        print(
+            "Post-processing deferred to the host yadepy stage for",
+            RUN_DIR.name,
+        )
+    elif ENABLE_POST_PROCESSING:
+        post_total_start = time.perf_counter()
+        try:
+            reconstruct_start = time.perf_counter()
+            subprocess.run(
+                ["python3", str(RECONSTRUCT_SCRIPT)],
+                cwd=RUN_DIR,
+                check=True,
+            )
+            reconstruct_seconds = time.perf_counter() - reconstruct_start
+
+            porosity_start = time.perf_counter()
+            subprocess.run(
+                ["python3", str(POROSITY_SCRIPT)],
+                cwd=RUN_DIR,
+                check=True,
+            )
+            porosity_seconds = time.perf_counter() - porosity_start
+            post_processing_succeeded = True
+            print(f"Post-processing complete for {RUN_DIR.name}")
+        except subprocess.CalledProcessError as error:
+            print(f"POST-PROCESSING FAILED for {RUN_DIR.name}: {error}")
+        finally:
+            post_processing_total_seconds = time.perf_counter() - post_total_start
+
+    timing_summary = pd.DataFrame([{
+        "run_id": RUN_ID,
+        "measuredEngineTotalSeconds": measured_engine_total,
+        "clumpingTimeSeconds": clumpingTimeSeconds,
+        "clumpingCallCount": clumpingCallCount,
+        "averageClumpingTimeSeconds": (
+            clumpingTimeSeconds / clumpingCallCount if clumpingCallCount else np.nan
+        ),
+        "reconstructSTLSeconds": reconstruct_seconds,
+        "porositySeconds": porosity_seconds,
+        "postProcessingTotalSeconds": post_processing_total_seconds,
+        "postProcessingEnabled": ENABLE_POST_PROCESSING,
+        "postProcessingDeferred": (
+            ENABLE_POST_PROCESSING and DEFER_POST_PROCESSING_TO_RUNNER
+        ),
+        "postProcessingSucceeded": post_processing_succeeded,
+    }])
+    timing_summary_path = RUN_DIR / "timing_summary.csv"
+    timing_summary.to_csv(timing_summary_path, index=False)
+
+    print("\n========== RUN TIMING SUMMARY ==========")
+    print(f"Clumping total = {clumpingTimeSeconds:.6f} s over {clumpingCallCount} clumps")
+    print(f"Reconstruction = {reconstruct_seconds:.6f} s")
+    print(f"Porosity = {porosity_seconds:.6f} s")
+    print(f"Post-processing total = {post_processing_total_seconds:.6f} s")
+    print("Saved:", timing_summary_path)
+
+    O.pause()
+    sys.exit(0)
+
+
+def controlSimulation():
+    global simPhase
+
+    if finished:
+        return
+
+    unbalanced_force = unbalancedForce()
+    kinetic_energy = utils.kineticEnergy()
+    all_rocks_inserted = rockCounter >= nRocks
+
+    # The fallback clock starts only after the wall ramp is complete, so a
+    # partial relaxation can never be collected as a result and the restored
+    # bed receives the full final-settling allowance.
+    if (
+        simPhase == "final_settling"
+        and all_rocks_inserted
+        and settlingPhaseStartIter is not None
+        and O.iter - settlingPhaseStartIter
+        >= MAXIMUM_ITERATIONS_AFTER_LAST_INSERTION
+    ):
+        finishSimulation(
+            unbalanced_force,
+            finish_reason="final_settling_iteration_limit",
+            equilibrium_reached=False,
+        )
+        return
+
+    if simPhase == "initial_settling":
+        if not all_rocks_inserted:
+            resetSettlingCheck(None)
+            return
+
+        if settlingPhaseStartIter is None:
+            resetSettlingCheck(lastInsertionIter)
+
+        if not unbalancedForceHasSettled(unbalanced_force, SETTLE_UB_THRESHOLD):
+            return
+
+        print("\nINITIAL PACKING SETTLED")
+        print("Iteration =", O.iter)
+        print("Unbalanced force =", unbalanced_force)
+        print("Kinetic energy (diagnostic only) =", kinetic_energy, "J")
+        print("Required consecutive low-residual steps =", SETTLE_HOLD_STEPS)
+
+        startRelaxation(unbalanced_force, kinetic_energy)
+        return
+
+    if simPhase == "relaxing_walls":
+        applyRelaxationStep()
+
+        if O.iter - relaxationStartIter >= RELAXATION_STEPS:
+            holdWallsAtOriginalBounds()
+            removeSourceCompressionLid()
+            simPhase = "final_settling"
+            resetSettlingCheck(O.iter)
+            print("\nWALL-RELAXATION RAMP COMPLETE")
+            print("Stop iteration =", O.iter)
+            print("Restored box bounds =", current_box_bounds())
+            print("Waiting for final settling...")
+        return
+
+    if simPhase == "final_settling":
+        holdWallsAtOriginalBounds()
+        if unbalancedForceHasSettled(unbalanced_force, FINAL_UB_THRESHOLD):
+            print("\nPACKING SETTLED AFTER WALL RELAXATION")
+            print("Iteration =", O.iter)
+            print("Unbalanced force =", unbalanced_force)
+            print("Kinetic energy (diagnostic only) =", kinetic_energy, "J")
+            finishSimulation(unbalanced_force)
+        return
+
+    raise RuntimeError(f"Unknown simulation phase: {simPhase}")
+
+
+def addPlotData():
+    unbalanced_force = unbalancedForce()
+    kinetic_energy = utils.kineticEnergy()
+    kinetic_energy_over_density = kinetic_energy / ROCK_DENSITY
+    wall_force = totalWallForceMagnitude()
+
+    if simPhase in {"initial_settling", "final_settling"}:
+        active_threshold = (
+            SETTLE_UB_THRESHOLD
+            if simPhase == "initial_settling"
+            else FINAL_UB_THRESHOLD
+        )
+
+        elapsed = (
+            O.iter - settlingPhaseStartIter
+            if settlingPhaseStartIter is not None else 0
+        )
+        print(
+            "SETTLING STATUS | phase =", simPhase,
+            "| iteration =", O.iter,
+            "| phase steps =", elapsed,
+            "| unbalanced force =", unbalanced_force,
+            "| threshold =", active_threshold,
+            "| kinetic energy =", kinetic_energy, "J",
+            "| contacted rocks =", len(externalContactedClumps()), "/",
+            len(rockTypeByClumpId),
+            "| inserted =", rockCounter,
+            "| erased =", deletedRockCount,
+            "| consecutive low-residual steps =",
+            f"{settledConsecutiveSteps}/{SETTLE_HOLD_STEPS}",
+        )
+
+    residualFile.write(
+        f"{O.iter},{O.time},{unbalanced_force},{kinetic_energy},"
+        f"{kinetic_energy_over_density},{settledConsecutiveSteps},"
+        f"{currentRelaxationFraction},{currentRelaxationDisplacement},"
+        f"{wall_force},{simPhase}\n"
+    )
+    residualFile.flush()
+
+
+O.run(wait=True)
+
+print("YADE run finished.", flush=True)
+sys.exit(0)
