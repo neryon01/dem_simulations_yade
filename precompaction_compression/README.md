@@ -62,6 +62,7 @@ Compression writes to runs/. Relaxation reads these completed compressed cases a
 Run from the study folder in an environment that provides the required executables and Python packages:
 
 **python3 run_parameter_study.py run**
+
 **python3 run_compression_relaxation.py run**
 
 Finish compression and its post-processing before starting relaxation. New dispatches require an empty destination run folder.
@@ -69,6 +70,7 @@ Finish compression and its post-processing before starting relaxation. New dispa
 To resume interrupted post-processing without repeating the YADE stage:
 
 **python3 run_parameter_study.py postprocess**
+
 **python3 run_compression_relaxation.py postprocess**
 
 Completed post-processing is skipped. To rebuild aggregate statistics and plots from existing per-run outputs, use collect instead of postprocess.
@@ -78,11 +80,13 @@ Completed post-processing is skipped. To rebuild aggregate statistics and plots 
 Run compression first:
 
 **bash run_precompaction_cm4_tiny.sh --preflight**
+
 **sbatch run_precompaction_cm4_tiny.sh**
 
 After compression and its post-processing finish, run relaxation:
 
 **bash run_compression_relaxation_cm4_tiny.sh --preflight**
+
 **sbatch run_compression_relaxation_cm4_tiny.sh**
 
 Both launchers request 20 CPUs. To resume only host-side post-processing, submit the corresponding launcher with --postprocess-only.
