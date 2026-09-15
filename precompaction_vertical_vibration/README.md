@@ -72,6 +72,11 @@ rock_1.stl to rock_4.stl
 
 The preflight check verifies that every source case has nRocksTarget = 80.
 
+# Run locally
+**python3 run_parameter_study.py dispatch**
+
+**python3 run_parameter_study.py postprocess**
+
 # Run on CoolMUC-4
 
 Check the Apptainer image path and yadepy environment name in the shell script.
