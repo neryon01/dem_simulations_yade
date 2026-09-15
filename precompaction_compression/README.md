@@ -39,10 +39,15 @@ Saved positions, orientations and clump configurations are restored at each rest
 Physical settings are defined in the packing scripts. The active compression settings are:
 
 enableVibration = 0
+
 enableCompression = 1
+
 compressionWidthReductionFrac = 0.15
+
 compressionSteps = 20000
+
 compressFloor = 0
+
 compressTop = 0
 
 The 15% reduction applies to the total original width in both X and Y. Each opposing wall moves inward by half that reduction. The floor does not move. A temporary lid confines the bed during compression.
@@ -55,7 +60,29 @@ Both runners use NUMBER_OF_SIMULATIONS = 100, MAX_SIMULTANEOUS_JOBS = 20 and JOB
 
 # Inputs
 
-Compression writes to runs/. Relaxation reads these completed compressed cases and writes to relaxation_runs/, leaving the sources unchanged. Keep the gravity sources available for the final paired comparison.
+The study folder must contain a directory or symbolic link named gravity_source_runs, pointing to the completed gravity results. It must contain run_000 through run_099, each from a gravity realization with nRocksTarget = 80.
+
+Each gravity run folder must contain:
+
+- yade_metrics.csv
+  
+- rock_poses.csv
+  
+- deleted_rocks.csv
+  
+- clump_template_configurations.csv
+  
+- porosity_result.csv
+  
+- rock_1.stl through rock_4.stl
+
+The study folder must also contain rock_1.gts through rock_4.gts.
+
+Compression cannot start without these gravity-source files. It reconstructs the saved gravity beds and writes the compressed results to runs/.
+
+Wall relaxation then requires the completed, post-processed compression results in runs/. It writes new results to relaxation_runs/, leaving the compressed sources unchanged.
+
+Keep gravity_source_runs available throughout both stages: the final relaxed-versus-gravity porosity comparison also reads the original gravity results.
 
 # Local execution
 
