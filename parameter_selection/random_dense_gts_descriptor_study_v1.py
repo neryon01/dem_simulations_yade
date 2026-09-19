@@ -1,29 +1,4 @@
 """
-UPDATED SCRIPT — 2026-09-07 — EXPANDED RANDOM-DENSE STUDY + INTEGRATED PLOTS
-
-This is a separate pilot study. It does not replace or modify the working
-regular-hexagonal clump script.
-
-For every GTS rock and requested resolution divisor, YADE's
-pack.randomDensePack is called five times with fixed, documented seeds.
-Member radii are polydisperse (rRelFuzz = 0.40). No lattice rotations are
-studied because randomDensePack has no fixed lattice orientation.
-
-The script reports individual-realisation and mean +/- sample-standard-
-deviation values for:
-    - member-sphere count and generated radius distribution;
-    - union volume and GTS volume coverage;
-    - generation time;
-    - contact-graph connectivity.
-
-Sphericity and convexity are calculated only for the original reference mesh
-(the GTS representation of the STL), not for the random sphere clumps.
-
-Eligibility is based only on clump construction and volume agreement. A
-realisation is eligible when it:
-    1. contains at most 60 member spheres;
-    2. has clump/GTS union-volume coverage between 0.90 and 1.10; and
-    3. forms one connected member-sphere contact graph.
 
 Outputs:
     random_dense_individual_results.csv
