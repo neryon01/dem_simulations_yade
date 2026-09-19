@@ -1,4 +1,4 @@
-## Guide To Parameter Selection 
+## Guide To Clump Resolution Selection 
 
 1. **random_dense_gts_descriptor_study_v1.py** - Evaluates randomDensePack clump generation for the four rock geometries over different resolution divisors, including sphere count, volume agreement, generation time, and connectivity.
 2. **generate_hexa_ortho_fidelity_comparison_v1.py** – Compares regular hexagonal and orthogonal sphere packings using spatial fidelity metrics such as IoU, GTS coverage, clump containment, and surface distance.
